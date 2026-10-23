@@ -36,10 +36,13 @@ use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_session::config::mitigation_coverage::DeniedPartialMitigation;
 use rustc_session::config::{OptLevel, OutputType, TargetModifier};
 use rustc_span::def_id::CRATE_MOD_ID;
-use rustc_span::hygiene::HygieneEncodeContext;
+use rustc_span::hygiene::{
+    HygieneEncodeContext, HygieneRemapper, HygieneRemappingResults, LocalExpnIdRemapper,
+    SyntaxContextRemapper,
+};
 use rustc_span::{
-    ByteSymbol, ExternalSource, FileName, SourceFile, SpanData, SpanEncoder, StableSourceFileId,
-    Symbol, SyntaxContext, bug, span_bug, sym,
+    ByteSymbol, ExternalSource, FileName, LocalExpnId, SourceFile, SpanData, SpanEncoder,
+    StableSourceFileId, Symbol, SyntaxContext, bug, span_bug, sym,
 };
 use rustc_structures::CrateType;
 use tracing::{debug, instrument, trace};
@@ -47,6 +50,7 @@ use twox_hash::XxHash3_128;
 
 use crate::diagnostics::{FailCreateFileEncoder, FailWriteFile};
 use crate::eii::EiiMapEncodedKeyValue;
+use crate::rmeta::remapped_def_id::RemappedRawDefId;
 use crate::rmeta::*;
 
 pub(super) struct EncodeContext<'a, 'tcx> {
@@ -78,6 +82,9 @@ pub(super) struct EncodeContext<'a, 'tcx> {
     hygiene_ctxt: Rc<RefCell<HygieneEncodeContext>>,
     // Used for both `Symbol`s and `ByteSymbol`s.
     symbol_index_table: FxHashMap<u32, usize>,
+    local_defs_remapping: LocalDefsRemapping,
+    syntax_context_remapping: HygieneRemappingResults<SyntaxContext>,
+    local_expn_id_remapping: HygieneRemappingResults<LocalExpnId>,
 }
 
 /// If the current crate is a proc-macro, returns early with `LazyArray::default()`.
@@ -100,6 +107,8 @@ macro_rules! encoder_methods {
 }
 
 impl<'a, 'tcx> Encoder for EncodeContext<'a, 'tcx> {
+    const DETERMINISTIC_HASH_MAP_ENCODE: bool = true;
+
     encoder_methods! {
         emit_usize(usize);
         emit_u128(u128);
@@ -148,6 +157,10 @@ impl<'a, 'tcx> Encodable<EncodeContext<'a, 'tcx>> for ExpnIndex {
 }
 
 impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
+    fn def_path_hasher(&self) -> impl Fn(DefId) -> DefPathHash {
+        self.tcx.prelocked_def_path_hasher()
+    }
+
     fn encode_crate_num(&mut self, crate_num: CrateNum) {
         if crate_num != LOCAL_CRATE && self.is_proc_macro {
             panic!("Attempted to encode non-local CrateNum {crate_num:?} for proc-macro crate");
@@ -164,13 +177,15 @@ impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
     }
 
     fn encode_def_id(&mut self, def_id: DefId) {
+        let def_id = self.local_defs_remapping.map_def_id(def_id);
+
         def_id.krate.encode(self);
         self.emit_u32(def_id.index.as_u32());
     }
 
     fn encode_syntax_context(&mut self, syntax_context: SyntaxContext) {
-        let idx = self.hygiene_ctxt.borrow_mut().get_syntax_ctxt_encoding_index(syntax_context);
-        idx.encode(self);
+        self.hygiene_ctxt.borrow_mut().enqueue_syntax_context_for_encoding(syntax_context);
+        self.emit_u32(self.syntax_context_remapping.map_id(syntax_context).as_u32());
     }
 
     fn encode_expn_id(&mut self, expn_id: ExpnId) {
@@ -182,7 +197,13 @@ impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
             self.hygiene_ctxt.borrow_mut().schedule_expn_data_for_encoding(expn_id);
         }
         expn_id.krate.encode(self);
-        expn_id.local_id.encode(self);
+
+        let expn_index = match expn_id.as_local() {
+            Some(local_expn) => self.local_expn_id_remapping.map_id(local_expn).as_raw(),
+            None => expn_id.local_id,
+        };
+
+        expn_index.encode(self);
     }
 
     fn encode_span(&mut self, span: Span) {
@@ -235,7 +256,7 @@ impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
     /// `LocalDefId` as a wrapper around def index we want to encode
     /// def index only, so we override the encode implementation.
     fn encode_local_def_id(&mut self, def_id: LocalDefId) {
-        self.emit_u32(def_id.local_def_index.as_u32());
+        self.emit_u32(self.local_defs_remapping.map_local_def_id(def_id).index.as_u32());
     }
 
     /// We override encoding logic for `DefKey` during metadata encoding,
@@ -434,20 +455,23 @@ macro_rules! record_some_lazy {
     ($self:ident.$tables:ident.$table:ident[$def_id:expr] <- $value:expr) => {{
         let value = $value;
         let lazy = $self.lazy(value);
-        $self.$tables.$table.set_some($def_id, lazy);
+        let def_id = $self.local_defs_remapping.map_local_def_id($def_id);
+        $self.$tables.$table.set_some(def_id, lazy);
     }};
 }
 
 macro_rules! record_some {
-    ($self:ident.$tables:ident.$table:ident[$def_id:expr] <- $value:expr) => {
-        $self.$tables.$table.set_some($def_id, $value)
-    };
+    ($self:ident.$tables:ident.$table:ident[$def_id:expr] <- $value:expr) => {{
+        let def_id = $self.local_defs_remapping.map_local_def_id($def_id);
+        $self.$tables.$table.set_some(def_id, $value)
+    }};
 }
 
 macro_rules! record_value {
-    ($self:ident.$tables:ident.$table:ident[$def_id:expr] <- $value:expr) => {
-        $self.$tables.$table.set($def_id, $value)
-    };
+    ($self:ident.$tables:ident.$table:ident[$def_id:expr] <- $value:expr) => {{
+        let def_id = $self.local_defs_remapping.map_local_def_id($def_id);
+        $self.$tables.$table.set(def_id, $value)
+    }};
 }
 
 // Shorthand for `$self.$tables.$table.set_some($def_id.index, $self.lazy_array($value))`, which would
@@ -456,7 +480,8 @@ macro_rules! record_array {
     ($self:ident.$tables:ident.$table:ident[$def_id:expr] <- $value:expr) => {{
         let value = $value;
         let lazy = $self.lazy_array(value);
-        $self.$tables.$table.set_some($def_id, lazy);
+        let def_id = $self.local_defs_remapping.map_local_def_id($def_id);
+        $self.$tables.$table.set_some(def_id, lazy);
     }};
 }
 
@@ -464,7 +489,8 @@ macro_rules! record_defaulted_array {
     ($self:ident.$tables:ident.$table:ident[$def_id:expr] <- $value:expr) => {{
         let value = $value;
         let lazy = $self.lazy_array(value);
-        $self.$tables.$table.set($def_id, lazy);
+        let def_id = $self.local_defs_remapping.map_local_def_id($def_id);
+        $self.$tables.$table.set(def_id, lazy);
     }};
 }
 
@@ -566,10 +592,12 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 record_value!(self.tables.def_path_hashes[def_id] <- def_path_hash.local_hash().as_u64())
             }
         } else {
-            for (def_index, def_key, def_path_hash) in defs.enumerated_keys_and_path_hashes() {
-                let def_id = LocalDefId { local_def_index: def_index };
+            for def_id in self.local_defs_remapping.iter_sorted_local_ids() {
+                let def_key = defs.def_key(def_id);
+                let hash = defs.def_path_hash(def_id).local_hash().as_u64();
+
                 record_some_lazy!(self.tables.def_keys[def_id] <- def_key);
-                record_value!(self.tables.def_path_hashes[def_id] <- def_path_hash.local_hash().as_u64())
+                record_value!(self.tables.def_path_hashes[def_id] <- hash);
             }
         }
     }
@@ -650,6 +678,19 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 
     fn encode_crate_root(&mut self) -> (LazyValue<CrateRoot>, LazyValue<CrateRootUnhashed>) {
         let tcx = self.tcx;
+
+        // We set it here as we need it only for metadata encoding,
+        // while `with_encode_metadata_header` is used in some other places too.
+        self.local_defs_remapping = LocalDefsRemapping::new(tcx);
+
+        (self.syntax_context_remapping, self.local_expn_id_remapping) = tcx
+            .with_stable_hashing_context(|mut ctx| {
+                (
+                    SyntaxContextRemapper::with(|r| r.remapping_results(&mut ctx)),
+                    LocalExpnIdRemapper::with(|r| r.remapping_results(&mut ctx)),
+                )
+            });
+
         let mut stats: Vec<(&'static str, usize)> = Vec::with_capacity(32);
 
         macro_rules! stat {
@@ -1489,8 +1530,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         }
 
         let tcx = self.tcx;
-
-        for local_id in tcx.iter_local_def_id() {
+        for local_id in self.local_defs_remapping.iter_sorted_local_ids() {
             let def_id = local_id.to_def_id();
             let def_kind = tcx.def_kind(local_id);
             record_some!(self.tables.def_kind[local_id] <- def_kind);
@@ -1630,13 +1670,18 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 && tcx.type_of(def_id).skip_binder().is_coroutine_closure()
             {
                 let coroutine_for_closure = self.tcx.coroutine_for_closure(def_id);
-                record_some!(self.tables.coroutine_for_closure[local_id] <- coroutine_for_closure.into());
+                let remapped_id =
+                    RemappedRawDefId::create(coroutine_for_closure, &self.local_defs_remapping);
+
+                record_some!(self.tables.coroutine_for_closure[local_id] <- remapped_id);
 
                 // If this async closure has a by-move body, record it too.
                 if tcx.needs_coroutine_by_move_body_def_id(coroutine_for_closure) {
                     let id = self.tcx.coroutine_by_move_body_def_id(coroutine_for_closure);
+                    let id = RemappedRawDefId::create(id, &self.local_defs_remapping);
+
                     record_some!(
-                        self.tables.coroutine_by_move_body_def_id[coroutine_for_closure.expect_local()] <- id.into()
+                        self.tables.coroutine_by_move_body_def_id[coroutine_for_closure.expect_local()] <- id
                     )
                 }
             }
@@ -2041,15 +2086,16 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         HygieneEncodeContext::encode(
             &Rc::clone(&self.hygiene_ctxt),
             &mut (&mut *self, &mut syntax_contexts, &mut expn_data_table, &mut expn_hash_table),
-            |(this, syntax_contexts, _, _), index, ctxt_data| {
-                syntax_contexts.set_some(index, this.lazy(ctxt_data));
+            |(this, syntax_contexts, _, _), ctxt, ctxt_data| {
+                let context = this.syntax_context_remapping.map_id(ctxt);
+                syntax_contexts.set_some(context.as_u32(), this.lazy(ctxt_data));
             },
-            |(this, _, expn_data_table, expn_hash_table), index, expn_data, hash| {
-                if let Some(index) = index.as_local() {
-                    expn_data_table
-                        .set_some(index.as_raw(), this.lazy(expn_data.expect("local expn")));
+            |(this, _, expn_data_table, expn_hash_table), expn_id, expn_data, hash| {
+                if let Some(expn_id) = expn_id.as_local() {
+                    let expn_index = this.local_expn_id_remapping.map_id(expn_id).as_raw();
 
-                    expn_hash_table.set_some(index.as_raw(), this.lazy(hash));
+                    expn_data_table.set_some(expn_index, this.lazy(expn_data.expect("local expn")));
+                    expn_hash_table.set_some(expn_index, this.lazy(hash));
                 }
             },
         );
@@ -2325,7 +2371,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 if let Ok(mut an) = trait_def.ancestors(tcx, local_id.to_def_id())
                     && let Some(specialization_graph::Node::Impl(parent)) = an.nth(1)
                 {
-                    record_some!(self.tables.impl_parent[local_id] <- parent.into());
+                    let parent = RemappedRawDefId::create(parent, &self.local_defs_remapping);
+                    record_some!(self.tables.impl_parent[local_id] <- parent);
                 }
 
                 // if this is an impl of `CoerceUnsized`, create its
@@ -2340,7 +2387,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         let trait_impls: Vec<_> = trait_impls
             .into_iter()
             .map(|(trait_def_id, impls)| TraitImpls {
-                trait_id: trait_def_id.into(),
+                trait_id: RemappedRawDefId::create(trait_def_id, &self.local_defs_remapping),
                 impls: self.lazy_array(&impls),
             })
             .collect();
@@ -2734,6 +2781,9 @@ fn with_encode_metadata_header(
         is_proc_macro: tcx.crate_types().contains(&CrateType::ProcMacro),
         hygiene_ctxt: Default::default(),
         symbol_index_table: Default::default(),
+        local_defs_remapping: Default::default(),
+        syntax_context_remapping: Default::default(),
+        local_expn_id_remapping: Default::default(),
     };
 
     // Encode the rustc version string in a predictable location.
@@ -2839,7 +2889,7 @@ pub(crate) fn provide(providers: &mut Providers) {
 /// use a different method for pretty-printing. Ideally this function
 /// should only ever be used as a fallback.
 pub fn rendered_const<'tcx>(tcx: TyCtxt<'tcx>, body: &hir::Body<'_>, def_id: LocalDefId) -> String {
-    let value = &body.value;
+    let value = body.value;
 
     #[derive(PartialEq, Eq)]
     enum Classification {
