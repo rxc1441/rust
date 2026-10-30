@@ -167,6 +167,7 @@ attribute_parsers!(
         ConfusablesParser,
         ConstStabilityParser,
         DocParser,
+        InlineParser,
         LintParser,
         MacroUseParser,
         NakedParser,
@@ -213,7 +214,6 @@ attribute_parsers!(
         Single<DoNotRecommendParser>,
         Single<ExportNameParser>,
         Single<IgnoreParser>,
-        Single<InlineParser>,
         Single<InstructionSetParser>,
         Single<InstrumentFnParser>,
         Single<LangParser>,
@@ -243,7 +243,6 @@ attribute_parsers!(
         Single<RustcDummyParser>,
         Single<RustcDumpDefPathParser>,
         Single<RustcDumpSymbolNameParser>,
-        Single<RustcForceInlineParser>,
         Single<RustcIfThisChangedParser>,
         Single<RustcLegacyConstGenericsParser>,
         Single<RustcLintOptDenyFieldAccessParser>,
@@ -362,6 +361,7 @@ attribute_parsers!(
         Single<WithoutArgs<SplatParser>>,
         Single<WithoutArgs<ThreadLocalParser>>,
         Single<WithoutArgs<TrackCallerParser>>,
+        Single<WithoutArgs<UncheckedTypeAliasParser>>,
         // tidy-alphabetical-end
     ];
 );
@@ -864,9 +864,8 @@ pub(crate) struct FinalizeCheckContext<'p, 'sess> {
     /// Unlike [`all_attrs`](Self::all_attrs), this contains the fully parsed attributes.
     pub(crate) parsed_attrs: &'p [Attribute],
 
-    /// The AST item these attributes were applied to, when the target is an item.
-    /// Used by `finalize_check` to inspect item structure that is not encoded in [`Target`].
-    pub(crate) target_item: Option<&'p rustc_ast::ast::Item>,
+    /// The AST item these attributes were applied to.
+    pub(crate) ast_target: rustc_attr_ir::target::AstTarget<'p>,
 }
 
 impl<'p, 'sess: 'p> Deref for FinalizeCheckContext<'p, 'sess> {

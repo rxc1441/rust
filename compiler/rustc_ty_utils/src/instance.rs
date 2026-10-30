@@ -163,7 +163,7 @@ fn resolve_associated_item<'tcx>(
                 match typing_env.typing_mode().assert_not_erased() {
                     ty::TypingMode::Coherence
                     | ty::TypingMode::Typeck { .. }
-                    | ty::TypingMode::PostTypeckUntilBorrowck { .. }
+                    | ty::TypingMode::PostTypeckThroughBorrowck { .. }
                     | ty::TypingMode::Reflection
                     | ty::TypingMode::PostBorrowck { .. } => false,
                     ty::TypingMode::PostAnalysis | ty::TypingMode::Codegen => {
@@ -255,15 +255,17 @@ fn resolve_associated_item<'tcx>(
                 // We only resolve totally substituted vtable entries.
                 None
             } else {
-                let vtable_base = tcx.first_method_vtable_slot(trait_ref);
-                let offset = tcx
-                    .own_existential_vtable_entries(trait_id)
-                    .iter()
-                    .copied()
-                    .position(|def_id| def_id == trait_item_id);
-                offset.map(|offset| Instance {
-                    def: ty::InstanceKind::Virtual(trait_item_id, vtable_base + offset),
-                    args: rcvr_args,
+                tcx.first_method_vtable_slot(trait_ref).and_then(|vtable_base| {
+                    let offset = tcx
+                        .own_existential_vtable_entries(trait_id)
+                        .iter()
+                        .copied()
+                        .position(|def_id| def_id == trait_item_id);
+
+                    offset.map(|offset| Instance {
+                        def: ty::InstanceKind::Virtual(trait_item_id, vtable_base + offset),
+                        args: rcvr_args,
+                    })
                 })
             }
         }

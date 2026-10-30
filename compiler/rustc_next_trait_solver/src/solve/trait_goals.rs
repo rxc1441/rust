@@ -5,9 +5,9 @@ use rustc_type_ir::fast_reject::DeepRejectCtxt;
 use rustc_type_ir::inherent::*;
 use rustc_type_ir::lang_items::SolverTraitLangItem;
 use rustc_type_ir::solve::{
-    AliasBoundKind, CandidatePreferenceMode, CanonicalResponse, ExternalConstraintsData, MaybeInfo,
-    NoSolutionOrRerunNonErased, OpaqueTypesJank, QueryResultOrRerunNonErased, RerunNonErased,
-    RerunReason, RerunResultExt, SizedTraitKind,
+    AliasBoundKind, CandidatePreferenceMode, CanonicalResponse, ExternalConstraintsData,
+    IsIdentity, MaybeInfo, NoSolutionOrRerunNonErased, OpaqueTypesJank,
+    QueryResultOrRerunNonErased, RerunNonErased, RerunReason, RerunResultExt, SizedTraitKind,
 };
 use rustc_type_ir::{
     self as ty, ClausePolarity, ExistentialPredicate, FieldInfo, Interner, MayBeErased, Movability,
@@ -1332,7 +1332,7 @@ where
 
         // Proving an auto trait for the hidden type must not constrain inference
         // variables, as that would leak the hidden type itself.
-        if !candidate.result.value.is_identity_modulo_regions() {
+        if candidate.result.value.var_values_is_identity == IsIdentity::No {
             return self.forced_ambiguity(MaybeInfo::AMBIGUOUS);
         }
 
@@ -1354,7 +1354,7 @@ where
                 // We're inferring regions of opaque types, but
                 // the type itself is already fully known, no way
                 // to leak the hidden type.
-                TypingMode::PostTypeckUntilBorrowck { .. } => {}
+                TypingMode::PostTypeckThroughBorrowck { .. } => {}
                 // We're inferring the hidden type of opaques, could
                 // leak types through it.
                 TypingMode::Typeck { .. } => {
@@ -1799,7 +1799,7 @@ where
                 | TypingMode::PostAnalysis
                 | TypingMode::Reflection
                 | TypingMode::Codegen
-                | TypingMode::PostTypeckUntilBorrowck { defining_opaque_types: _ }
+                | TypingMode::PostTypeckThroughBorrowck { defining_opaque_types: _ }
                 | TypingMode::PostBorrowck { defined_opaque_types: _ } => {}
             }
         }
