@@ -14,7 +14,7 @@ use rustc_span::{Span, Symbol};
 use std::str::FromStr as _;
 
 /// Validates a single clippy attribute and emits errors for unknown or deprecated ones.
-pub fn check_clippy_attr<A: AttributeExt>(sess: &Session, attr: &A) {
+pub fn check_clippy_attr(sess: &Session, attr: &rustc_ast::ast::Attribute) {
     if let [clippy, segment2] = &*attr.path()
         && *clippy == sym::clippy
     {
@@ -84,16 +84,18 @@ pub fn get_clippy_attr(tcx: TyCtxt<'_>, did: impl Into<DefId>, name: Symbol) -> 
 
 /// Checks whether `attrs` contain any of `proc_macro`, `proc_macro_derive` or
 /// `proc_macro_attribute`
-pub fn is_proc_macro(attrs: &[impl AttributeExt]) -> bool {
-    attrs.iter().any(AttributeExt::is_proc_macro_attr)
+pub fn is_proc_macro(attrs: &[rustc_attr_ir::Attribute]) -> bool {
+    find_attr!(
+        attrs,
+        ProcMacro
+        | ProcMacroAttribute
+        | ProcMacroDerive { .. }
+    )
 }
 
 /// Checks whether `attrs` contain `#[doc(hidden)]`
 pub fn is_doc_hidden(attrs: &[rustc_attr_ir::Attribute]) -> bool {
-    find_attr!(
-        attrs,
-        Doc(rustc_attr_ir::DocAttribute { hidden: Some(_), .. })
-    )
+    find_attr!(attrs, Doc(rustc_attr_ir::DocAttribute { hidden: Some(_), .. }))
 }
 
 /// Checks whether the given ADT, or any of its fields/variants, are marked as `#[non_exhaustive]`

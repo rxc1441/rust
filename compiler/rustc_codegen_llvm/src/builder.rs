@@ -160,7 +160,9 @@ impl<'a, 'll, CX: Borrow<SCx<'ll>>> GenericBuilder<'a, 'll, CX> {
         val
     }
 
-    pub(crate) fn inbounds_gep(
+    /// Don't use this method: instead use `inbounds_gep` or `inbounds_ptradd`.
+    // FIXME: Remove once unused.
+    pub(crate) fn typed_inbounds_gep(
         &mut self,
         ty: &'ll Type,
         ptr: &'ll Value,
@@ -175,6 +177,33 @@ impl<'a, 'll, CX: Borrow<SCx<'ll>>> GenericBuilder<'a, 'll, CX> {
                 indices.len() as c_uint,
                 UNNAMED,
                 GEPNoWrapFlags::InBounds,
+            )
+        }
+    }
+
+    fn build_gep(
+        &mut self,
+        stride: Size,
+        ptr: &'ll Value,
+        index: &'ll Value,
+        flags: GEPNoWrapFlags,
+    ) -> &'ll Value {
+        let ty = if stride.bytes() == 1 {
+            // LLVM prefers `i8` as the canonical form for a single-byte GEP.
+            self.cx.type_i8()
+        } else {
+            self.cx.type_array(self.cx.type_i8(), stride.bytes())
+        };
+        let indices = &[index];
+        unsafe {
+            llvm::LLVMBuildGEPWithNoWrapFlags(
+                self.llbuilder(),
+                ty,
+                ptr,
+                indices.as_ptr(),
+                indices.len() as c_uint,
+                UNNAMED,
+                flags,
             )
         }
     }
@@ -690,7 +719,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
 
         unsafe {
             let alloca = llvm::LLVMBuildAlloca(bx.llbuilder(), scalable_vector_ty, UNNAMED);
-            llvm::LLVMSetAlignment(alloca, layout.align.abi.bytes() as c_uint);
+            llvm::LLVMSetAlignment(alloca, layout.align.bytes() as c_uint);
             alloca
         }
     }
@@ -876,17 +905,13 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         self.set_metadata_node(load, llvm::MD_nonnull, &[]);
     }
 
-    fn store(&mut self, val: &'ll Value, ptr: &'ll Value, align: Align) -> &'ll Value {
-        self.store_with_flags(val, ptr, align, MemFlags::empty())
-    }
-
     fn store_with_flags(
         &mut self,
         val: &'ll Value,
         ptr: &'ll Value,
         align: Align,
         flags: MemFlags,
-    ) -> &'ll Value {
+    ) {
         debug!("Store {:?} -> {:?} ({:?})", val, ptr, flags);
         assert_eq!(self.cx.type_kind(self.cx.val_ty(ptr)), TypeKind::Pointer);
         unsafe {
@@ -937,7 +962,6 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
                 let md = llvm::LLVMMDNodeInContext2(self.cx.llcx, args.as_ptr(), args.len());
                 self.set_metadata(store, id, md);
             }
-            store
         }
     }
 
@@ -963,56 +987,16 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         }
     }
 
-    fn gep(&mut self, ty: &'ll Type, ptr: &'ll Value, indices: &[&'ll Value]) -> &'ll Value {
-        unsafe {
-            llvm::LLVMBuildGEPWithNoWrapFlags(
-                self.llbuilder(),
-                ty,
-                ptr,
-                indices.as_ptr(),
-                indices.len() as c_uint,
-                UNNAMED,
-                GEPNoWrapFlags::default(),
-            )
-        }
+    fn gep(&mut self, stride: Size, ptr: &'ll Value, index: &'ll Value) -> &'ll Value {
+        self.build_gep(stride, ptr, index, GEPNoWrapFlags::default())
     }
 
-    fn inbounds_gep(
-        &mut self,
-        ty: &'ll Type,
-        ptr: &'ll Value,
-        indices: &[&'ll Value],
-    ) -> &'ll Value {
-        unsafe {
-            llvm::LLVMBuildGEPWithNoWrapFlags(
-                self.llbuilder(),
-                ty,
-                ptr,
-                indices.as_ptr(),
-                indices.len() as c_uint,
-                UNNAMED,
-                GEPNoWrapFlags::InBounds,
-            )
-        }
+    fn inbounds_gep(&mut self, stride: Size, ptr: &'ll Value, index: &'ll Value) -> &'ll Value {
+        self.build_gep(stride, ptr, index, GEPNoWrapFlags::InBounds)
     }
 
-    fn inbounds_nuw_gep(
-        &mut self,
-        ty: &'ll Type,
-        ptr: &'ll Value,
-        indices: &[&'ll Value],
-    ) -> &'ll Value {
-        unsafe {
-            llvm::LLVMBuildGEPWithNoWrapFlags(
-                self.llbuilder(),
-                ty,
-                ptr,
-                indices.as_ptr(),
-                indices.len() as c_uint,
-                UNNAMED,
-                GEPNoWrapFlags::InBounds | GEPNoWrapFlags::NUW,
-            )
-        }
+    fn inbounds_nuw_gep(&mut self, stride: Size, ptr: &'ll Value, index: &'ll Value) -> &'ll Value {
+        self.build_gep(stride, ptr, index, GEPNoWrapFlags::InBounds | GEPNoWrapFlags::NUW)
     }
 
     /* Casts */
@@ -1305,7 +1289,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     }
 
     fn cleanup_landing_pad(&mut self, pers_fn: &'ll Value) -> (&'ll Value, &'ll Value) {
-        let ty = self.type_struct(&[self.type_ptr(), self.type_i32()], false);
+        let ty = self.type_struct(&[self.type_ptr(), self.type_i32()]);
         let landing_pad = self.landing_pad(ty, pers_fn, 0);
         unsafe {
             llvm::LLVMSetCleanup(landing_pad, llvm::TRUE);
@@ -1314,13 +1298,13 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     }
 
     fn filter_landing_pad(&mut self, pers_fn: &'ll Value) {
-        let ty = self.type_struct(&[self.type_ptr(), self.type_i32()], false);
+        let ty = self.type_struct(&[self.type_ptr(), self.type_i32()]);
         let landing_pad = self.landing_pad(ty, pers_fn, 1);
         self.add_clause(landing_pad, self.const_array(self.type_ptr(), &[]));
     }
 
     fn resume(&mut self, exn0: &'ll Value, exn1: &'ll Value) {
-        let ty = self.type_struct(&[self.type_ptr(), self.type_i32()], false);
+        let ty = self.type_struct(&[self.type_ptr(), self.type_i32()]);
         let mut exn = self.const_poison(ty);
         exn = self.insert_value(exn, exn0, 0);
         exn = self.insert_value(exn, exn1, 1);
@@ -1727,11 +1711,7 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
             .val
             .store(&mut body_bx, PlaceRef::new_sized_aligned(current, cg_elem.layout, align));
 
-        let next = body_bx.inbounds_gep(
-            self.backend_type(cg_elem.layout),
-            current,
-            &[self.const_usize(1)],
-        );
+        let next = body_bx.inbounds_ptradd(current, self.const_usize(cg_elem.layout.size.bytes()));
         body_bx.br(header_bb);
         header_bx.add_incoming_to_phi(current, next, body_bb);
 

@@ -31,7 +31,7 @@ use rustc_infer::traits::WellFormedLoc;
 use rustc_infer::traits::query::NoSolution;
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, AllowTwoPhase};
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
-use rustc_middle::ty::{self, AdtKind, GenericArgsRef, Ty, TypeVisitableExt, Unnormalized};
+use rustc_middle::ty::{self, AdtKind, ConstKind, GenericArgs, Ty, TypeVisitableExt, Unnormalized};
 use rustc_session::diagnostics::feature_err;
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::hygiene::DesugaringKind;
@@ -1561,7 +1561,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     false,
                     TupleArgumentsFlag::DontTupleArguments,
                     SplatLoweringInfo::Error(guar),
-                    Some(GenericArgsRef::default()),
+                    Some(GenericArgs::default()),
                 );
 
                 err_ty
@@ -1779,6 +1779,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             _ => None,
         };
 
+        let old_diverges = self.diverges.get();
+
         let (element_ty, t) = match uty {
             Some(uty) => {
                 self.check_expr_coercible_to_type(element, uty, None);
@@ -1790,6 +1792,39 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 (element_ty, ty)
             }
         };
+
+        // FIXME: remove this workaround for an unsoundness (#165323) once it's no longer needed.
+        //
+        // MIR building lowers `[CONST; 0]` to `[]`, making `CONST` not evaluated.
+        //
+        // This is a problem, because it means if `CONST` is `const { panic!() }`, the side effect
+        // of panic / failing compilation never happens. In such cases we need to ignore divergence
+        // from the `CONST`, as otherwise we can end up executing code that was assumed unreachable.
+        let count_is_zero = match count.kind() {
+            // This is the exact check that mir building does
+            ConstKind::Value(v) => v.try_to_target_usize(tcx) == Some(0),
+
+            // An infer const can get inferred to 0.
+            //
+            // We could check the expectation here to do ad-hoc inference, but that feels quite
+            // error prone and annoying.
+            ConstKind::Infer(_) => true,
+
+            // While const generic params can be substituted with 0, mir building specifically
+            // checks for value 0 before monomorphization, so they (alongside aliases, etc) cannot
+            // trigger the bug.
+            ConstKind::Param(_)
+            | ConstKind::Placeholder(_)
+            | ConstKind::Alias(..)
+            | ConstKind::Error(_)
+            | ConstKind::Expr(_) => false,
+
+            ConstKind::Bound(..) => bug!(),
+        };
+
+        if count_is_zero && element.is_constant_for_zero_repeat() {
+            self.diverges.set(old_diverges);
+        }
 
         if let Err(guar) = element_ty.error_reported() {
             return Ty::new_error(tcx, guar);
@@ -1968,7 +2003,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             tcx.check_stability(v_field.did, Some(field.hir_id), field.span, None);
                         }
 
-                        Ok(self.field_ty(field.span, v_field, args))
+                        Ok(self.field_ty(field.span, v_field, *args))
                     } else {
                         error_happened = true;
                         let guar = if let Some(prev_span) = seen_fields.get(&ident) {
@@ -2010,7 +2045,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             if let Err(diag) = diag {
                 if idx == hir_fields.len() - 1 {
                     if remaining_fields.is_empty() {
-                        self.suggest_fru_from_range_and_emit(field, variant, args, diag);
+                        self.suggest_fru_from_range_and_emit(field, variant, *args, diag);
                     } else {
                         diag.stash(field.span, StashKey::MaybeFruTypo);
                     }
@@ -2116,12 +2151,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     ty::Adt(adt, args) if adt.is_struct() => variant
                         .fields
                         .iter()
-                        .map(|f| self.normalize(span, f.ty(self.tcx, args)))
+                        .map(|f| self.normalize(span, f.ty(self.tcx, *args)))
                         .collect(),
                     ty::Adt(adt, args) if adt.is_enum() => variant
                         .fields
                         .iter()
-                        .map(|f| self.normalize(span, f.ty(self.tcx, args)))
+                        .map(|f| self.normalize(span, f.ty(self.tcx, *args)))
                         .collect(),
                     _ => {
                         self.dcx().emit_err(FunctionalRecordUpdateOnNonStruct { span });
@@ -2156,7 +2191,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 let ident =
                                     self.tcx.adjust_ident(f.ident(self.tcx), variant.def_id);
                                 if let Some(_) = remaining_fields.remove(&ident) {
-                                    let target_ty = self.field_ty(base_expr.span, f, args);
+                                    let target_ty = self.field_ty(base_expr.span, f, *args);
                                     let cause = self.misc(base_expr.span);
                                     if let Err(diag) =
                                         self.demand_suptype_diag(cause.span, target_ty, fru_ty)
@@ -2219,7 +2254,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         ty::Adt(adt, args) if adt.is_struct() => variant
                             .fields
                             .iter()
-                            .map(|f| self.normalize(expr.span, f.ty(self.tcx, args)))
+                            .map(|f| self.normalize(expr.span, f.ty(self.tcx, *args)))
                             .collect(),
                         _ => {
                             self.dcx().emit_err(FunctionalRecordUpdateOnNonStruct {
@@ -2276,7 +2311,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             remaining_fields,
                             variant,
                             hir_fields,
-                            args,
+                            *args,
                         );
                     }
                 }
@@ -2316,7 +2351,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         remaining_fields: UnordMap<Ident, (FieldIdx, &ty::FieldDef)>,
         variant: &'tcx ty::VariantDef,
         hir_fields: &'tcx [hir::ExprField<'tcx>],
-        args: GenericArgsRef<'tcx>,
+        args: GenericArgs<'tcx>,
     ) {
         let len = remaining_fields.len();
 
@@ -2393,7 +2428,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         &self,
         last_expr_field: &hir::ExprField<'tcx>,
         variant: &ty::VariantDef,
-        args: GenericArgsRef<'tcx>,
+        args: GenericArgs<'tcx>,
         mut err: Diag<'_>,
     ) {
         if is_range_literal(last_expr_field.expr)
@@ -2621,6 +2656,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         match variant.ctor {
             Some((CtorKind::Fn, def_id)) => match ty.kind() {
                 ty::Adt(adt, ..) if adt.is_enum() => {
+                    err.span_context(self.tcx.def_span(adt.did()).shrink_to_lo());
                     err.span_label(
                         variant_ident_span,
                         format!(
@@ -2817,7 +2853,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             self.register_predicates(autoderef.into_obligations());
 
                             self.tcx.check_stability(field.did, Some(expr.hir_id), expr.span, None);
-                            return self.field_ty(expr.span, field, args);
+                            return self.field_ty(expr.span, field, *args);
                         }
 
                         // The field is not accessible, fall through to error reporting.
@@ -3263,7 +3299,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         );
 
                         let ty_str = match base_ty.peel_refs().kind() {
-                            ty::Adt(def, args) => self.tcx.def_path_str_with_args(def.did(), args),
+                            ty::Adt(def, args) => self.tcx.def_path_str_with_args(def.did(), *args),
                             _ => base_ty.peel_refs().to_string(),
                         };
                         err.multipart_suggestion(
@@ -3402,7 +3438,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 .map(|field_def| {
                                     (
                                         field_def.ident(self.tcx).normalize_to_macros_2_0(),
-                                        field_def.ty(self.tcx, args).skip_norm_wip(),
+                                        field_def.ty(self.tcx, *args).skip_norm_wip(),
                                     )
                                 })
                                 .collect::<Vec<_>>(),
@@ -3886,7 +3922,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         break;
                     };
 
-                    let field_ty = self.field_ty(expr.span, field, args);
+                    let field_ty = self.field_ty(expr.span, field, *args);
 
                     // Enums are anyway always sized. But just to safeguard against future
                     // language extensions, let's double-check.
@@ -3925,7 +3961,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         .iter_enumerated()
                         .find(|(_, f)| f.ident(self.tcx).normalize_to_macros_2_0() == ident)
                     {
-                        let field_ty = self.field_ty(expr.span, field, args);
+                        let field_ty = self.field_ty(expr.span, field, *args);
 
                         if self.tcx.features().offset_of_slice() {
                             self.require_type_has_static_alignment(field_ty, expr.span);

@@ -401,6 +401,29 @@ pub(crate) struct ExpectedNoArgs;
 pub(crate) struct ExpectedNameValue;
 
 #[derive(Diagnostic)]
+#[diag("expected either `doc(notable_trait)` or `doc(notable_trait(color=\"...\"))`")]
+#[warning(
+    "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
+)]
+#[help("only one color should be specified")]
+pub(crate) struct DuplicateNotableTraitColor;
+
+#[derive(Diagnostic)]
+#[diag("expected either `doc(notable_trait)` or `doc(notable_trait(color=\"...\"))`")]
+#[warning(
+    "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
+)]
+pub(crate) struct InvalidNotableTraitAttr;
+
+#[derive(Diagnostic)]
+#[diag("unknown color in `doc(notable_trait(color=\"...\"))`")]
+#[warning(
+    "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
+)]
+#[help("expected grey, gray, red, green, yellow, blue, magenta, cyan, or transparent")]
+pub(crate) struct InvalidNotableTraitColor;
+
+#[derive(Diagnostic)]
 #[diag("malformed `{$attribute}` attribute")]
 #[help("{$options}")]
 pub(crate) struct MalFormedDiagnosticAttributeLint {
@@ -1035,6 +1058,13 @@ pub(crate) struct DocAttrNotCrateLevel {
 }
 
 #[derive(Diagnostic)]
+#[diag("`#[doc(...)]` isn't allowed on parameters")]
+pub(crate) struct DocAttrNotParameters {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag("nonexistent keyword `{$keyword}` used in `#[doc(keyword = \"...\")]`")]
 #[help("only existing keywords are allowed in core/std")]
 pub(crate) struct DocKeywordNotKeyword {
@@ -1050,6 +1080,17 @@ pub(crate) struct DocAttributeNotAttribute {
     #[primary_span]
     pub span: Span,
     pub attribute: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag("`#![doc({$attr_name})]` must be a trait attribute")]
+#[warning(
+    "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
+)]
+pub(crate) struct DocAttrNotTraitLevel {
+    #[primary_span]
+    pub span: Span,
+    pub attr_name: Symbol,
 }
 
 #[derive(Diagnostic)]
@@ -1410,7 +1451,7 @@ pub(crate) struct InvalidTarget {
     )]
     pub previously_accepted: bool,
     #[note(
-        "placing this attribute on a macro invocation does nothing even if the macro expands to what would be a valid target for the attribute"
+        "attributes on a macro invocation apply to the invocation itself and are not forwarded to its expansion"
     )]
     pub on_macro_call: bool,
 }
@@ -2155,24 +2196,23 @@ pub(crate) struct MalformedAttribute {
 
 #[derive(Subdiagnostic)]
 pub(crate) enum MalformedAttributeKind {
-    #[label("bad attribute argument")]
-    BadAttributeArgument(#[primary_span] Span),
     #[label("reason in lint attribute must come last")]
     ReasonMustComeLast(#[primary_span] Span),
 }
 
 #[derive(Diagnostic)]
-#[diag("expected a lint, found literal")]
-pub(crate) struct BadAttributeLit {
+#[diag("malformed `{$kind}` attribute input")]
+pub(crate) struct MalformedLintAttributeInput {
     #[primary_span]
     #[label("not the name of a lint")]
     pub span: Span,
+    pub kind: Symbol,
     #[subdiagnostic]
-    pub help: BadAttributeLitHelp,
+    pub help: MalformedLintAttributeInputHelp,
 }
 
 #[derive(Subdiagnostic)]
-pub(crate) enum BadAttributeLitHelp {
+pub(crate) enum MalformedLintAttributeInputHelp {
     #[help("try using `#[{$kind}({$sym})]`")]
     StrLit { sym: Symbol, kind: Symbol },
     #[help("for example, write `#[{$kind}(dead_code)]` for `dead_code`")]
@@ -2199,3 +2239,19 @@ pub(crate) struct Unused {
 #[derive(Diagnostic)]
 #[diag("use of deprecated `no_link` attribute")]
 pub(crate) struct NoLinkAttrUsed;
+
+#[derive(Diagnostic)]
+#[diag("`#[doc({$attr_name} = \"...\")]` should be used on anonymous constants")]
+pub(crate) struct DocKeywordAttributeNotAnonConst {
+    #[primary_span]
+    pub span: Span,
+    pub attr_name: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag("the `lint::{$unknown}` attribute is not recognized")]
+pub(crate) struct UnknownLintHelper {
+    #[primary_span]
+    pub span: Span,
+    pub unknown: Symbol,
+}
